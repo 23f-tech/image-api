@@ -1,5 +1,6 @@
 import base64
 import binascii
+import io
 import os
 import re
 
@@ -7,16 +8,13 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from google import genai
 from google.genai import types
+from PIL import Image
 from pydantic import BaseModel
 
 
-app = FastAPI(
-    title="Multimodal Image Question Answering API",
-    version="1.0.0"
-)
+app = FastAPI(title="Image QA API")
 
 
-# Allow the grader's Cloudflare Worker to call this API.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -31,50 +29,27 @@ class ImageQuestionRequest(BaseModel):
     question: str
 
 
-def get_client():
-    api_key = os.getenv("GEMINI_API_KEY")
-
-    if not api_key:
-        raise RuntimeError(
-            "GEMINI_API_KEY environment variable is not configured."
-        )
-
-    return genai.Client(api_key=api_key)
-
-
 def clean_answer(answer: str) -> str:
-    """
-    Convert the model response into the exact short string
-    expected by the automated grader.
-    """
-
     answer = answer.strip()
 
-    # Remove Markdown formatting.
     answer = answer.replace("```json", "")
     answer = answer.replace("```text", "")
     answer = answer.replace("```", "")
     answer = answer.replace("**", "")
     answer = answer.strip()
 
-    # Remove common response prefixes.
     answer = re.sub(
-        r"^(the\s+answer\s+is|final\s+answer|answer|result)\s*[:\-]\s*",
+        r"^(the\s+answer\s+is|final\s+answer|answer|result)\s*[:\-]?\s*",
         "",
         answer,
         flags=re.IGNORECASE,
     ).strip()
 
-    # Remove surrounding quotation marks.
     answer = answer.strip('"').strip("'").strip()
 
-    # Prepare a possible numeric answer.
     numeric = answer.replace(",", "").strip()
-
-    # Remove leading currency symbols.
     numeric = re.sub(r"^[₹$€£]\s*", "", numeric)
 
-    # Remove common trailing words and symbols.
     numeric = re.sub(
         r"\s*(rupees?|dollars?|euros?|pounds?|units?|percent|%)\s*$",
         "",
@@ -82,18 +57,69 @@ def clean_answer(answer: str) -> str:
         flags=re.IGNORECASE,
     ).strip()
 
-    # Return only the number when the whole answer is numeric.
     if re.fullmatch(r"-?\d+(?:\.\d+)?", numeric):
         return numeric
 
     return answer
 
 
+def decode_image(encoded_image: str):
+    encoded_image = encoded_image.strip()
+
+    if encoded_image.startswith("data:"):
+        if "," not in encoded_image:
+            raise ValueError("Invalid image data URL.")
+
+        encoded_image = encoded_image.split(",", 1)[1]
+
+    # Remove spaces, tabs and line breaks from base64.
+    encoded_image = re.sub(r"\s+", "", encoded_image)
+
+    try:
+        image_bytes = base64.b64decode(encoded_image)
+    except (binascii.Error, ValueError) as error:
+        raise ValueError("Invalid base64 image.") from error
+
+    if not image_bytes:
+        raise ValueError("Decoded image is empty.")
+
+    try:
+        image = Image.open(io.BytesIO(image_bytes))
+        image.verify()
+
+        # Reopen after verify().
+        image = Image.open(io.BytesIO(image_bytes))
+
+    except Exception as error:
+        raise ValueError("The supplied data is not a valid image.") from error
+
+    image_format = (image.format or "PNG").upper()
+
+    mime_types = {
+        "PNG": "image/png",
+        "JPEG": "image/jpeg",
+        "JPG": "image/jpeg",
+        "WEBP": "image/webp",
+        "GIF": "image/gif",
+    }
+
+    mime_type = mime_types.get(image_format, "image/png")
+
+    # Convert unsupported formats to PNG.
+    if image_format not in mime_types:
+        converted = io.BytesIO()
+        image.convert("RGB").save(converted, format="PNG")
+        image_bytes = converted.getvalue()
+        mime_type = "image/png"
+
+    return image_bytes, mime_type
+
+
 @app.get("/")
 def root():
     return {
         "status": "running",
-        "message": "Image question-answering API is ready"
+        "message": "Image question-answering API is ready",
     }
 
 
@@ -104,90 +130,50 @@ def health():
 
 @app.post("/answer-image")
 def answer_image(data: ImageQuestionRequest):
-    if not data.question.strip():
-        raise HTTPException(
-            status_code=400,
-            detail="Question cannot be empty."
-        )
-
-    encoded_image = data.image_base64.strip()
-
-    # Support both plain base64 and data URLs:
-    # data:image/png;base64,AAAA...
-    if encoded_image.startswith("data:"):
-        if "," not in encoded_image:
+    try:
+        if not data.question.strip():
             raise HTTPException(
                 status_code=400,
-                detail="Invalid image data URL."
+                detail="Question cannot be empty.",
             )
 
-        encoded_image = encoded_image.split(",", 1)[1]
+        image_bytes, mime_type = decode_image(data.image_base64)
 
-    try:
-        image_bytes = base64.b64decode(
-            encoded_image,
-            validate=True
-        )
-    except (binascii.Error, ValueError):
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid base64 image."
-        )
+        api_key = os.getenv("GEMINI_API_KEY")
 
-    if not image_bytes:
-        raise HTTPException(
-            status_code=400,
-            detail="The decoded image is empty."
-        )
+        if not api_key:
+            raise RuntimeError(
+                "GEMINI_API_KEY is missing in Render environment variables."
+            )
 
-    prompt = f"""
-You are answering a question about an image for an automated grader.
+        client = genai.Client(api_key=api_key)
+
+        prompt = f"""
+Examine the supplied image carefully and answer the question.
 
 Question:
 {data.question}
 
-Examine the entire image carefully.
-
-Possible image categories include:
-- receipt
-- invoice
-- pie chart
-- bar chart
-- table
-- infographic
-
 Rules:
-1. Return only the final answer.
-2. Do not explain your reasoning.
-3. Do not write a sentence.
-4. For numeric answers, return only the number.
-5. Do not include commas in numeric answers.
-6. Do not include currency symbols.
-7. Do not include units.
-8. Do not include a percentage symbol.
-9. For a receipt, distinguish grand total from subtotal, tax, cash, and change.
-10. For a bar chart, read every relevant bar and calculate carefully.
-11. For a pie chart, use visible labels, values, percentages, and slice sizes.
-12. Verify arithmetic before answering.
-13. The response must be suitable for exact automated comparison.
+- Return only the final answer.
+- Do not explain.
+- Do not return a sentence.
+- For numeric answers, return only the number.
+- Do not include commas, currency symbols, units, or percentage signs.
+- For receipts, use the requested final or grand total, not subtotal,
+  tax, cash paid, or change.
+- For charts, carefully read all labels and values.
+- When a calculation is requested, verify the arithmetic.
 """
-
-    try:
-        client = get_client()
 
         response = client.models.generate_content(
             model="gemini-2.5-flash",
             contents=[
-                types.Content(
-                    role="user",
-                    parts=[
-                        types.Part.from_text(text=prompt),
-                        types.Part.from_bytes(
-                            data=image_bytes,
-                            mime_type="image/png"
-                        ),
-                    ],
-                )
+                types.Part.from_bytes(
+                    data=image_bytes,
+                    mime_type=mime_type,
+                ),
+                prompt,
             ],
             config=types.GenerateContentConfig(
                 temperature=0,
@@ -196,28 +182,36 @@ Rules:
         )
 
         if not response.text:
-            raise HTTPException(
-                status_code=500,
-                detail="The model returned an empty answer."
-            )
+            raise RuntimeError("Gemini returned an empty response.")
 
         answer = clean_answer(response.text)
 
         if not answer:
-            raise HTTPException(
-                status_code=500,
-                detail="The final answer was empty."
-            )
+            raise RuntimeError("Cleaned answer is empty.")
 
         return {"answer": str(answer)}
 
     except HTTPException:
         raise
 
+    except ValueError as error:
+        print("INPUT ERROR:", repr(error), flush=True)
+
+        raise HTTPException(
+            status_code=400,
+            detail=str(error),
+        )
+
     except Exception as error:
-        print("Gemini processing error:", repr(error))
+        # This exact error will appear in Render Logs.
+        print(
+            "ANSWER-IMAGE ERROR:",
+            type(error).__name__,
+            str(error),
+            flush=True,
+        )
 
         raise HTTPException(
             status_code=500,
-            detail="Unable to process the image."
+            detail="Image processing failed.",
         )
